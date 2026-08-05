@@ -1,35 +1,52 @@
 import os
+import time
+import requests
 import gradio as gr
 import numpy as np
-import torch
-from transformers import DebertaV2Tokenizer, DebertaV2ForSequenceClassification
 
 # ── Config ────────────────────────────────────────────────────────────────────
-HF_MODEL_REPO  = "Shitanshu06/mcq-deberta-v3-large"
-OPTION_LABELS  = ["A", "B", "C", "D", "E"]
-MAX_LENGTH     = 192
+HF_MODEL_REPO = "Shitanshu06/mcq-deberta-v3-large"
+HF_API_URL    = f"https://api-inference.huggingface.co/models/{HF_MODEL_REPO}"
+HF_TOKEN      = os.environ.get("HF_TOKEN", "")          # set in Render env vars
+OPTION_LABELS = ["A", "B", "C", "D", "E"]
 
-# ── Model loader (cached globally) ────────────────────────────────────────────
-_model     = None
-_tokenizer = None
-_device    = None
+HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 
-def load_model():
-    global _model, _tokenizer, _device
-    if _model is None:
-        _device    = "cuda" if torch.cuda.is_available() else "cpu"
-        _tokenizer = DebertaV2Tokenizer.from_pretrained(HF_MODEL_REPO)
-        _model     = DebertaV2ForSequenceClassification.from_pretrained(
-            HF_MODEL_REPO, num_labels=1
-        )
-        _model.to(_device)
-        _model.eval()
-    return _model, _tokenizer, _device
+# ── HuggingFace Inference API call ────────────────────────────────────────────
+def _hf_score(question: str, option: str) -> float:
+    """
+    Call HF Inference API for SequenceClassification with a single (question, option) pair.
+    Returns a float relevance score.
+    """
+    payload = {
+        "inputs": {
+            "text":      question,
+            "text_pair": option,
+        }
+    }
+    for attempt in range(3):
+        resp = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=60)
+        if resp.status_code == 503:
+            # Model is loading — wait and retry
+            wait = resp.json().get("estimated_time", 20)
+            time.sleep(min(wait, 30))
+            continue
+        if resp.status_code == 200:
+            data = resp.json()
+            # API returns [[{"label":..., "score":...}]] for classification
+            if isinstance(data, list) and len(data) > 0:
+                row = data[0]
+                if isinstance(row, list):
+                    row = row[0]
+                return float(row.get("score", 0.0))
+            return 0.0
+        # Other error
+        resp.raise_for_status()
+    return 0.0
 
 
-# ── Inference ─────────────────────────────────────────────────────────────────
-@torch.no_grad()
+# ── Predict function ──────────────────────────────────────────────────────────
 def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e):
     options = [opt_a, opt_b, opt_c, opt_d, opt_e]
 
@@ -41,20 +58,10 @@ def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e):
         missing = ", ".join(OPTION_LABELS[i] for i in empty)
         return f"⚠️ Please fill option(s): {missing}", "", {lb: 0.0 for lb in OPTION_LABELS}, _make_bar_html([0.0]*5)
 
-    model, tokenizer, device = load_model()
-
-    logits = []
-    for option in options:
-        encoded = tokenizer(
-            prompt, option,
-            truncation=True,
-            padding="max_length",
-            max_length=MAX_LENGTH,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(device) for k, v in encoded.items()}
-        out    = model(**inputs)
-        logits.append(out.logits.squeeze().item())
+    try:
+        logits = [_hf_score(prompt, opt) for opt in options]
+    except Exception as e:
+        return f"❌ API Error: {e}", "", {lb: 0.0 for lb in OPTION_LABELS}, _make_bar_html([0.0]*5)
 
     logits     = np.array(logits)
     ranked_idx = np.argsort(logits)[::-1]
@@ -81,9 +88,7 @@ def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e):
 | 🥉 3rd | {ranked_lbl[2]} | {probs[ranked_idx[2]]:.1%} |
 """
     prob_dict = {OPTION_LABELS[i]: float(probs[i]) for i in range(5)}
-    bar_html  = _make_bar_html(probs)
-
-    return pred_md, top3_str, prob_dict, bar_html
+    return pred_md, top3_str, prob_dict, _make_bar_html(probs)
 
 
 def _make_bar_html(probs):
@@ -275,20 +280,20 @@ with gr.Blocks(
 | **Base Model** | `microsoft/deberta-v3-large` |
 | **Task** | 5-Option Multiple Choice QA |
 | **Architecture** | `DebertaV2ForSequenceClassification` (num_labels=1) |
-| **Inference** | Scores each (question, option) pair independently |
+| **Inference** | HuggingFace Inference API (no local GPU needed) |
 | **Max Length** | 192 tokens per pair |
 | **Training** | K-Fold cross-validation with early stopping |
 | **Metric** | MAP@3 (Mean Average Precision @ 3) |
 
 ### How It Works
-1. Each `(question, option)` pair is tokenized separately
+1. Each `(question, option)` pair is sent to HuggingFace Inference API
 2. The model outputs a **relevance score** for each pair
 3. Options are **ranked** by score — highest = predicted answer
 4. Top-3 predictions returned for MAP@3 evaluation
 
 ### Links
 - 🤗 **Model Repo**: [Shitanshu06/mcq-deberta-v3-large](https://huggingface.co/Shitanshu06/mcq-deberta-v3-large)
-- 🚀 **Space**: [Shitanshu06/smart-mcq-solver-large](https://huggingface.co/spaces/Shitanshu06/smart-mcq-solver-large)
+- 🚀 **Live App**: [deberta-v3-large.onrender.com](https://deberta-v3-large.onrender.com)
 - 📚 **Course**: IIT Madras BS — Deep Learning & GenAI (T2-2026)
 - 👤 **Author**: Shitanshu Chaurasiya · Roll No. 24F2006167
 """)
