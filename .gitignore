@@ -1,6 +1,7 @@
 # ── Large model weight files (stored on HuggingFace Hub instead) ─────────────
 deberta_v3_large/deberta_v3.pth
 deberta_v3_large_hf/
+deberta_v3_large.zip
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
