@@ -1,0 +1,50 @@
+# ── Large model weight files (stored on HuggingFace Hub instead) ─────────────
+deberta_v3_large/deberta_v3.pth
+deberta_v3_large_hf/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+*.whl
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+ENV/
+
+# ── Secrets / tokens ─────────────────────────────────────────────────────────
+.env.local
+*.env
+secrets.txt
+hf_token.txt
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Data / outputs ────────────────────────────────────────────────────────────
+data/
+outputs/
+logs/
+wandb/
