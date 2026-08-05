@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 import gradio as gr
 import numpy as np
@@ -7,69 +6,70 @@ import numpy as np
 # ── Config ────────────────────────────────────────────────────────────────────
 HF_MODEL_REPO = "Shitanshu06/mcq-deberta-v3-large"
 HF_API_URL    = f"https://api-inference.huggingface.co/models/{HF_MODEL_REPO}"
-HF_TOKEN      = os.environ.get("HF_TOKEN", "")          # set in Render env vars
+HF_TOKEN      = os.environ.get("HF_TOKEN", "")
 OPTION_LABELS = ["A", "B", "C", "D", "E"]
+HEADERS       = {"Authorization": f"Bearer {HF_TOKEN}"}
 
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-
-# ── HuggingFace Inference API call ────────────────────────────────────────────
+# ── HuggingFace Inference API ─────────────────────────────────────────────────
 def _hf_score(question: str, option: str) -> float:
-    """
-    Call HF Inference API for SequenceClassification with a single (question, option) pair.
-    Returns a float relevance score.
-    """
-    payload = {
-        "inputs": {
-            "text":      question,
-            "text_pair": option,
-        }
+    """Score a (question, option) pair using HF Serverless Inference API."""
+    # Concatenate as a single string — most robust format for serverless API
+    combined = f"{question} {option}"
+    payload  = {
+        "inputs":     combined,
+        "parameters": {},
+        "options":    {"wait_for_model": True, "use_cache": True},
     }
-    for attempt in range(3):
-        resp = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=60)
-        if resp.status_code == 503:
-            # Model is loading — wait and retry
-            wait = resp.json().get("estimated_time", 20)
-            time.sleep(min(wait, 30))
-            continue
-        if resp.status_code == 200:
-            data = resp.json()
-            # API returns [[{"label":..., "score":...}]] for classification
-            if isinstance(data, list) and len(data) > 0:
-                row = data[0]
-                if isinstance(row, list):
-                    row = row[0]
-                return float(row.get("score", 0.0))
-            return 0.0
-        # Other error
-        resp.raise_for_status()
+    resp = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Handle various response shapes from HF API
+    if isinstance(data, list):
+        item = data[0]
+        if isinstance(item, list):
+            item = item[0]
+        if isinstance(item, dict):
+            return float(item.get("score", 0.0))
+        if isinstance(item, (int, float)):
+            return float(item)
+    if isinstance(data, dict):
+        return float(data.get("score", 0.0))
     return 0.0
 
 
-# ── Predict function ──────────────────────────────────────────────────────────
+# ── Predict ───────────────────────────────────────────────────────────────────
 def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e):
     options = [opt_a, opt_b, opt_c, opt_d, opt_e]
 
     if not prompt.strip():
-        return "⚠️ Please enter a question.", "", {lb: 0.0 for lb in OPTION_LABELS}, _make_bar_html([0.0]*5)
+        return "⚠️ Please enter a question.", "", {lb: 0.0 for lb in OPTION_LABELS}, _bar_html([0.0]*5)
 
     empty = [i for i, o in enumerate(options) if not o.strip()]
     if empty:
         missing = ", ".join(OPTION_LABELS[i] for i in empty)
-        return f"⚠️ Please fill option(s): {missing}", "", {lb: 0.0 for lb in OPTION_LABELS}, _make_bar_html([0.0]*5)
+        return f"⚠️ Fill in option(s): {missing}", "", {lb: 0.0 for lb in OPTION_LABELS}, _bar_html([0.0]*5)
 
-    try:
-        logits = [_hf_score(prompt, opt) for opt in options]
-    except Exception as e:
-        return f"❌ API Error: {e}", "", {lb: 0.0 for lb in OPTION_LABELS}, _make_bar_html([0.0]*5)
+    # Score each option via API
+    logits = []
+    for opt in options:
+        try:
+            logits.append(_hf_score(prompt, opt))
+        except Exception as e:
+            return (
+                f"❌ API Error: {str(e)[:120]}\n\n"
+                f"The model may still be loading on HuggingFace servers. "
+                f"Please wait 20 seconds and try again.",
+                "", {lb: 0.0 for lb in OPTION_LABELS}, _bar_html([0.0]*5)
+            )
 
     logits     = np.array(logits)
     ranked_idx = np.argsort(logits)[::-1]
     ranked_lbl = [OPTION_LABELS[i] for i in ranked_idx]
-
-    top3_str = " → ".join(ranked_lbl[:3])
-    best     = ranked_lbl[0]
-    best_txt = options[OPTION_LABELS.index(best)]
+    top3_str   = " → ".join(ranked_lbl[:3])
+    best       = ranked_lbl[0]
+    best_txt   = options[OPTION_LABELS.index(best)]
 
     exp_l = np.exp(logits - logits.max())
     probs = exp_l / exp_l.sum()
@@ -88,10 +88,10 @@ def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e):
 | 🥉 3rd | {ranked_lbl[2]} | {probs[ranked_idx[2]]:.1%} |
 """
     prob_dict = {OPTION_LABELS[i]: float(probs[i]) for i in range(5)}
-    return pred_md, top3_str, prob_dict, _make_bar_html(probs)
+    return pred_md, top3_str, prob_dict, _bar_html(probs)
 
 
-def _make_bar_html(probs):
+def _bar_html(probs):
     colors = ["#7c3aed", "#4f46e5", "#0ea5e9", "#10b981", "#f59e0b"]
     bars   = ""
     for i, (lbl, p) in enumerate(zip(OPTION_LABELS, probs)):
@@ -119,7 +119,7 @@ def _make_bar_html(probs):
     </div>"""
 
 
-# ── Built-in test examples ─────────────────────────────────────────────────────
+# ── Test Examples ─────────────────────────────────────────────────────────────
 EXAMPLES = [
     ["Which of the following is NOT a supervised learning algorithm?",
      "Linear Regression", "K-Means Clustering", "Decision Tree",
@@ -135,7 +135,7 @@ EXAMPLES = [
      "Basic Encoder with Recursive Training"],
     ["Which activation function is most commonly used in deep networks today?",
      "Sigmoid", "Tanh", "ReLU", "Softmax", "Linear"],
-    ["What does 'gradient vanishing' refer to in deep learning?",
+    ["What does gradient vanishing refer to in deep learning?",
      "Model weights becoming very large during training",
      "Gradients becoming extremely small, slowing learning in early layers",
      "The loss function failing to converge",
@@ -143,8 +143,8 @@ EXAMPLES = [
      "Batch normalization reducing gradient flow"],
 ]
 
-# ── CSS ────────────────────────────────────────────────────────────────────────
-CUSTOM_CSS = """
+# ── CSS ───────────────────────────────────────────────────────────────────────
+CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 * { font-family: 'Inter', sans-serif !important; }
 body, .gradio-container {
@@ -170,10 +170,11 @@ body, .gradio-container {
 footer { display: none !important; }
 """
 
-HEADER_HTML = """
-<div style="text-align:center;padding:30px 0 10px;font-family:'Inter',sans-serif;">
-  <div style="display:inline-block;background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.4);
-              border-radius:20px;padding:4px 14px;font-size:12px;color:#a78bfa;font-weight:600;
+HEADER = """
+<div style="text-align:center;padding:30px 0 10px;">
+  <div style="display:inline-block;background:rgba(124,58,237,0.15);
+              border:1px solid rgba(124,58,237,0.4);border-radius:20px;
+              padding:4px 14px;font-size:12px;color:#a78bfa;font-weight:600;
               letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;">
     🎓 IIT Madras · DL &amp; GenAI Project · T2-2026
   </div>
@@ -184,27 +185,30 @@ HEADER_HTML = """
   </h1>
   <p style="font-size:1.05rem;color:#94a3b8;margin:0 0 4px;">
     Powered by <strong style="color:#a78bfa;">DeBERTa-v3-large</strong>
-    fine-tuned for 5-option Multiple Choice Questions
+    fine-tuned for 5-option MCQs
   </p>
   <p style="font-size:0.85rem;color:#64748b;">
     Author: <strong style="color:#818cf8;">Shitanshu Chaurasiya</strong> · Roll No. 24F2006167
   </p>
+  <p style="font-size:0.8rem;color:#475569;margin-top:6px;">
+    ⚡ First prediction may take ~30s (model warm-up). Subsequent ones are fast.
+  </p>
 </div>
 """
 
-# ── Build UI ───────────────────────────────────────────────────────────────────
+# ── UI ─────────────────────────────────────────────────────────────────────────
 with gr.Blocks(
     title="Smart MCQ Solver — DeBERTa-v3-large",
     theme=gr.themes.Soft(primary_hue="violet", secondary_hue="indigo", neutral_hue="slate"),
-    css=CUSTOM_CSS,
+    css=CSS,
 ) as demo:
 
-    gr.HTML(HEADER_HTML)
+    gr.HTML(HEADER)
 
     with gr.Tabs():
 
-        # ── TAB 1: Predict ────────────────────────────────────────────────────
-        with gr.TabItem("🔍 Predict", id="tab_predict"):
+        # ── Predict tab ───────────────────────────────────────────────────────
+        with gr.TabItem("🔍 Predict"):
             with gr.Row(equal_height=False):
                 with gr.Column(scale=5):
                     gr.Markdown("### 📝 Your Question")
@@ -227,17 +231,14 @@ with gr.Blocks(
 
                 with gr.Column(scale=4):
                     gr.Markdown("### 📊 Prediction Results")
-                    prediction_out = gr.Markdown(
-                        value="*Prediction will appear here...*",
-                        elem_id="prediction_out",
-                    )
+                    prediction_out = gr.Markdown(value="*Prediction will appear here...*", elem_id="prediction_out")
                     top3_out = gr.Textbox(label="🏆 MAP@3 Ranking", interactive=False, elem_id="top3_out")
                     prob_out = gr.Label(label="📈 Confidence (all options)", num_top_classes=5, elem_id="prob_out")
                     bar_out  = gr.HTML(elem_id="bar_chart")
 
-        # ── TAB 2: Test Examples ──────────────────────────────────────────────
-        with gr.TabItem("🧪 Test Examples", id="tab_test"):
-            gr.Markdown("### 🧪 Built-in Test Cases\nClick **Run** on any example to see the model's prediction.")
+        # ── Test tab ──────────────────────────────────────────────────────────
+        with gr.TabItem("🧪 Test Examples"):
+            gr.Markdown("### 🧪 Built-in Test Cases\nClick **Run** on any example to test the model.")
 
             test_labels = [
                 "🤖 ML: Unsupervised Algorithm",
@@ -246,7 +247,6 @@ with gr.Blocks(
                 "⚡ DL: Best Activation Function",
                 "📉 DL: Gradient Vanishing",
             ]
-
             for idx, (tlabel, ex) in enumerate(zip(test_labels, EXAMPLES)):
                 with gr.Accordion(tlabel, open=(idx == 0)):
                     with gr.Row():
@@ -260,18 +260,18 @@ with gr.Blocks(
                                 td = gr.Textbox(value=ex[4], label="Option D", interactive=False)
                             te = gr.Textbox(value=ex[5], label="Option E", interactive=False)
                         with gr.Column(scale=2):
-                            run_btn   = gr.Button(f"▶ Run Test {idx+1}", variant="primary", elem_id=f"run_test_{idx}")
+                            run_btn   = gr.Button(f"▶ Run Test {idx+1}", variant="primary", elem_id=f"run_{idx}")
                             test_pred = gr.Markdown(value="*Click Run to predict...*")
                             test_bar  = gr.HTML()
 
                     def _run(q, a, b, c, d, e):
-                        pm, t3, _, bh = predict(q, a, b, c, d, e)
+                        pm, _, _, bh = predict(q, a, b, c, d, e)
                         return pm, bh
 
                     run_btn.click(fn=_run, inputs=[tq, ta, tb, tc, td, te], outputs=[test_pred, test_bar])
 
-        # ── TAB 3: About ──────────────────────────────────────────────────────
-        with gr.TabItem("ℹ️ About", id="tab_about"):
+        # ── About tab ─────────────────────────────────────────────────────────
+        with gr.TabItem("ℹ️ About"):
             gr.Markdown("""
 ## 🧠 About This Model
 
@@ -280,48 +280,34 @@ with gr.Blocks(
 | **Base Model** | `microsoft/deberta-v3-large` |
 | **Task** | 5-Option Multiple Choice QA |
 | **Architecture** | `DebertaV2ForSequenceClassification` (num_labels=1) |
-| **Inference** | HuggingFace Inference API (no local GPU needed) |
-| **Max Length** | 192 tokens per pair |
-| **Training** | K-Fold cross-validation with early stopping |
-| **Metric** | MAP@3 (Mean Average Precision @ 3) |
-
-### How It Works
-1. Each `(question, option)` pair is sent to HuggingFace Inference API
-2. The model outputs a **relevance score** for each pair
-3. Options are **ranked** by score — highest = predicted answer
-4. Top-3 predictions returned for MAP@3 evaluation
+| **Inference** | HuggingFace Serverless Inference API |
+| **Training Metric** | MAP@3 (Mean Average Precision @ 3) |
+| **Training** | K-Fold cross-validation + early stopping |
 
 ### Links
-- 🤗 **Model Repo**: [Shitanshu06/mcq-deberta-v3-large](https://huggingface.co/Shitanshu06/mcq-deberta-v3-large)
-- 🚀 **Live App**: [deberta-v3-large.onrender.com](https://deberta-v3-large.onrender.com)
-- 📚 **Course**: IIT Madras BS — Deep Learning & GenAI (T2-2026)
+- 🤗 **Model**: [Shitanshu06/mcq-deberta-v3-large](https://huggingface.co/Shitanshu06/mcq-deberta-v3-large)
+- 🚀 **App**: [deberta-v3-large.onrender.com](https://deberta-v3-large.onrender.com)
+- 📚 **Course**: IIT Madras BS — DL & GenAI (T2-2026)
 - 👤 **Author**: Shitanshu Chaurasiya · Roll No. 24F2006167
 """)
 
-    # ── Wire predict ───────────────────────────────────────────────────────────
+    # ── Events ────────────────────────────────────────────────────────────────
     predict_btn.click(
         fn=predict,
         inputs=[prompt_input, opt_a, opt_b, opt_c, opt_d, opt_e],
         outputs=[prediction_out, top3_out, prob_out, bar_out],
     )
-
-    # ── Wire clear ────────────────────────────────────────────────────────────
     clear_btn.click(
-        fn=lambda: ("", "", "", "", "", "",
-                    "*Prediction will appear here...*", "", {lb: 0.0 for lb in OPTION_LABELS}, ""),
+        fn=lambda: ("", "", "", "", "", "", "*Prediction will appear here...*", "", {lb: 0.0 for lb in OPTION_LABELS}, ""),
         inputs=[],
-        outputs=[prompt_input, opt_a, opt_b, opt_c, opt_d, opt_e,
-                 prediction_out, top3_out, prob_out, bar_out],
+        outputs=[prompt_input, opt_a, opt_b, opt_c, opt_d, opt_e, prediction_out, top3_out, prob_out, bar_out],
     )
-
-    # ── Quick-fill examples ────────────────────────────────────────────────────
     gr.Examples(
         examples=EXAMPLES,
         inputs=[prompt_input, opt_a, opt_b, opt_c, opt_d, opt_e],
         label="⚡ Quick Fill (click to auto-fill inputs)",
         cache_examples=False,
     )
-
 
 if __name__ == "__main__":
     demo.launch(
