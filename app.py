@@ -608,45 +608,49 @@ TOPBAR = f"""
   <div style="flex:1;display:flex;align-items:center;justify-content:space-between;
               padding:18px 30px;gap:24px;flex-wrap:wrap;">
 
-    <div style="display:flex;align-items:center;gap:14px;">
-      <div style="width:42px;height:42px;background:linear-gradient(135deg,#00f5d4,#818cf8);
-                  border-radius:10px;display:flex;align-items:center;justify-content:center;
-                  font-size:22px;box-shadow:0 0 20px rgba(0,245,212,0.4);">🧠</div>
-      <div>
-        <div style="font-size:20px;font-weight:900;font-family:'Inter',sans-serif;
-                    background:linear-gradient(90deg,#00f5d4,#c7d2fe);
-                    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-                    letter-spacing:-0.5px;">
-          Multi-Model DeBERTa · Smart MCQ Solver
+    <!-- Left Block: Title, Subtitle & Badges -->
+    <div>
+      <div style="display:flex;align-items:center;gap:14px;">
+        <div style="width:42px;height:42px;background:linear-gradient(135deg,#00f5d4,#818cf8);
+                    border-radius:10px;display:flex;align-items:center;justify-content:center;
+                    font-size:22px;box-shadow:0 0 20px rgba(0,245,212,0.4);">🧠</div>
+        <div>
+          <div style="font-size:20px;font-weight:900;font-family:'Inter',sans-serif;
+                      background:linear-gradient(90deg,#00f5d4,#c7d2fe);
+                      -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                      letter-spacing:-0.5px;">
+            Multi-Model DeBERTa · Smart MCQ Solver
+          </div>
+          <div style="font-size:11px;color:#94a3b8;letter-spacing:1.5px;text-transform:uppercase;
+                      margin-top:2px;">FINE-TUNED PYTORCH MODELS (MCQ-DEBERTA-V3-LARGE &amp; MCQ-DEBERTA-V3-BEST-V2)</div>
         </div>
-        <div style="font-size:11px;color:#94a3b8;letter-spacing:2px;text-transform:uppercase;
-                    margin-top:2px;">Fine-Tuned PyTorch Models (mcq-deberta-v3-large &amp; mcq-deberta-v3-best-v2)</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:12px;">
+        <div style="background:rgba(0,245,212,0.1);border:1px solid rgba(0,245,212,0.3);
+                    border-radius:8px;padding:5px 12px;display:flex;align-items:center;gap:8px;">
+          <div style="width:8px;height:8px;border-radius:50%;background:#00f5d4;
+                      box-shadow:0 0 10px #00f5d4;"></div>
+          <span style="font-size:11px;color:#00f5d4;font-weight:800;
+                       letter-spacing:1px;">⚡ DEBERTA_V3_LARGE (0.4B)</span>
+        </div>
+        <div style="background:rgba(129,140,248,0.1);border:1px solid rgba(129,140,248,0.3);
+                    border-radius:8px;padding:5px 12px;">
+          <span style="font-size:11px;color:#c7d2fe;font-weight:700;letter-spacing:1px;">
+            MAP@3 BEST: 1.0000 ✅
+          </span>
+        </div>
       </div>
     </div>
 
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-      <div style="background:rgba(0,245,212,0.1);border:1px solid rgba(0,245,212,0.3);
-                  border-radius:8px;padding:6px 14px;display:flex;align-items:center;gap:8px;">
-        <div style="width:8px;height:8px;border-radius:50%;background:#00f5d4;
-                    box-shadow:0 0 10px #00f5d4;"></div>
-        <span style="font-size:11px;color:#00f5d4;font-weight:800;
-                     letter-spacing:1px;">⚡ DEBERTA_V3_LARGE (0.4B)</span>
-      </div>
-      <div style="background:rgba(129,140,248,0.1);border:1px solid rgba(129,140,248,0.3);
-                  border-radius:8px;padding:6px 14px;">
-        <span style="font-size:11px;color:#c7d2fe;font-weight:700;letter-spacing:1px;">
-          MAP@3 BEST: 1.0000 ✅
-        </span>
-      </div>
-    </div>
-
+    <!-- Right Block: Name & Roll Number -->
     <div style="text-align:right;">
-      <div style="font-size:13px;color:#f8fafc;font-weight:700;
+      <div style="font-size:15px;color:#ffffff;font-weight:800;
                   font-family:'Inter',sans-serif;">Shitanshu Chaurasiya</div>
-      <div style="font-size:10px;color:#94a3b8;margin-top:2px;letter-spacing:1px;">
+      <div style="font-size:11px;color:#94a3b8;margin-top:4px;letter-spacing:1px;">
         Roll No: 24F2006167 · IIT Madras BS
       </div>
     </div>
+
   </div>
 </div>
 """
