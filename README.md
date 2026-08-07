@@ -44,17 +44,25 @@ This repository contains the complete inference pipeline, multi-model Gradio web
 ## 🗂️ Professional Project Directory Structure
 
 ```
-.
-├── app.py                      # Main Gradio multi-model web application & inference engine
-├── requirements.txt            # Python dependencies (torch, transformers, gradio, etc.)
-├── render.yaml                 # Deployment configuration for Render cloud platform
-├── README.md                   # Complete documentation & benchmark specs
-├── LICENSE                     # MIT Open Source License
-└── deberta_v3_large/           # Local model weights, tokenizer & configuration
-    ├── config.json             # Model architecture hyperparameters
-    ├── tokenizer.json          # DeBERTa-v3 Fast Tokenizer vocabulary & merges
-    ├── tokenizer_config.json   # Tokenizer configuration & special tokens
-    └── model.safetensors       # PyTorch fine-tuned model checkpoint (0.4B weights)
+Smart-MCQ-Solver-DeBERTa/
+│
+├── app.py                          # 🚀 Main Gradio multi-model web application & inference engine
+├── requirements.txt                # 📦 Python dependencies (torch, transformers, gradio, etc.)
+├── README.md                       # 📖 Full documentation with badges & benchmark table
+├── LICENSE                         # ⚖️  MIT Open Source License
+│
+├── config/                         # ⚙️  Deployment & server configuration
+│   └── render.yaml                 # Render cloud deployment configuration
+│
+├── docs/                           # 📚 Project documentation
+│   ├── README.md                   # Documentation index & key links
+│   └── architecture.md             # Model pipeline diagram & training config
+│
+└── deberta_v3_large/               # 🤖 Fine-tuned model weights & tokenizer
+    ├── config.json                 # Model architecture hyperparameters
+    ├── tokenizer.json              # DeBERTa-v3 Fast Tokenizer vocabulary
+    ├── tokenizer_config.json       # Tokenizer settings & special tokens
+    └── model.safetensors           # PyTorch fine-tuned weights (~1.74 GB, gitignored)
 ```
 
 ---
