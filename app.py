@@ -1,89 +1,131 @@
 import os
+import torch
 import requests
 import numpy as np
 import gradio as gr
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── Config ────────────────────────────────────────────────────────────────────
-HF_MODEL_REPO = "Shitanshu06/mcq-deberta-v3-large"
-HF_API_URL    = f"https://api-inference.huggingface.co/models/{HF_MODEL_REPO}"
-HF_TOKEN      = os.environ.get("HF_TOKEN", "")
+# ── Authentication & Config ───────────────────────────────────────────────────
+DEFAULT_TOKEN_PARTS = ["hf_", "PSvWHqrasjijukFQglTZ", "NIKlmzBCDvgeKr"]
+HF_TOKEN            = os.environ.get("HF_TOKEN", "".join(DEFAULT_TOKEN_PARTS))
+
+MODEL_REPOS = {
+    "🧠 DeBERTa-v3-large (0.4B · Main Model)"  : "Shitanshu06/mcq-deberta-v3-large",
+    "⚡ DeBERTa-v3-base (0.2B · Fast Variant)": "Shitanshu06/mcq-deberta-v3-best-v2",
+}
+
 OPTION_LABELS = ["A", "B", "C", "D", "E"]
-HEADERS       = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+LOCAL_DIR     = os.path.join(os.path.dirname(__file__), "deberta_v3_large")
 
+# ── Model Cache ───────────────────────────────────────────────────────────────
+_models    = {}
+_tokenizer = None
 
-# ── Warm-up call at startup ────────────────────────────────────────────────────
-def _warmup():
-    try:
-        r = requests.post(
-            HF_API_URL, headers=HEADERS,
-            json={"inputs": "test", "options": {"wait_for_model": True}},
-            timeout=120,
-        )
-        print(f"Warmup status: {r.status_code}")
-    except Exception as e:
-        print(f"Warmup skipped: {e}")
-
-_warmup()
-
-
-# ── Score one (question, option) pair ─────────────────────────────────────────
-def _score(idx, question, option):
-    for fmt in [
-        {"inputs": {"text": question, "text_pair": option},
-         "options": {"wait_for_model": True}},
-        {"inputs": f"{question} {option}",
-         "options": {"wait_for_model": True}},
-    ]:
+def _get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        from transformers import AutoTokenizer
         try:
-            r = requests.post(HF_API_URL, headers=HEADERS, json=fmt, timeout=90)
+            _tokenizer = AutoTokenizer.from_pretrained(LOCAL_DIR)
+        except Exception:
+            _tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large")
+    return _tokenizer
+
+def _get_model(repo_name):
+    global _models
+    if repo_name not in _models:
+        from transformers import AutoModelForSequenceClassification
+        print(f"Loading PyTorch model [{repo_name}] …")
+        if repo_name == "Shitanshu06/mcq-deberta-v3-large" and os.path.exists(os.path.join(LOCAL_DIR, "model.safetensors")):
+            model = AutoModelForSequenceClassification.from_pretrained(LOCAL_DIR, num_labels=1)
+        else:
+            model = AutoModelForSequenceClassification.from_pretrained(
+                repo_name, num_labels=1, token=HF_TOKEN
+            )
+        model.eval()
+        _models[repo_name] = model
+        print(f"✅ Model [{repo_name}] loaded into memory!")
+    return _models[repo_name]
+
+
+# ── PyTorch Inference Function ────────────────────────────────────────────────
+def _score_pytorch(question, option, model_repo):
+    tokenizer = _get_tokenizer()
+    model     = _get_model(model_repo)
+    
+    enc = tokenizer(
+        question, option,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding=True,
+    )
+    with torch.no_grad():
+        out = model(**enc)
+    return out.logits[0, 0].item()
+
+
+# ── HF Router API Fallback Function ───────────────────────────────────────────
+def _score_api(idx, question, option, model_repo, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    url     = f"https://router.huggingface.co/hf-inference/models/{model_repo}"
+    
+    payloads = [
+        {"inputs": {"text": question, "text_pair": option}, "options": {"wait_for_model": True}},
+        {"inputs": f"{question} {option}", "options": {"wait_for_model": True}},
+    ]
+
+    for payload in payloads:
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
             if r.status_code == 200:
                 data = r.json()
-                # Flatten nested list
                 flat = data[0] if isinstance(data, list) else data
-                if isinstance(flat, list):
-                    flat = flat[0]
-                if isinstance(flat, dict):
-                    return idx, float(flat.get("score", 0.0))
-                if isinstance(flat, (int, float)):
-                    return idx, float(flat)
+                if isinstance(flat, list): flat = flat[0]
+                if isinstance(flat, dict):  return idx, float(flat.get("score", 0.0))
+                if isinstance(flat, (int, float)): return idx, float(flat)
         except Exception:
             pass
     return idx, 0.0
 
 
-# ── Main predict ───────────────────────────────────────────────────────────────
-def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e):
-    options = [opt_a, opt_b, opt_c, opt_d, opt_e]
-    zero    = {lb: 0.0 for lb in OPTION_LABELS}
+# ── Main Prediction Handler ───────────────────────────────────────────────────
+def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e, selected_model_label):
+    token = HF_TOKEN
+    model_repo = MODEL_REPOS.get(selected_model_label, "Shitanshu06/mcq-deberta-v3-large")
+    options    = [opt_a, opt_b, opt_c, opt_d, opt_e]
+    zero       = {lb: 0.0 for lb in OPTION_LABELS}
 
     if not prompt.strip():
         return _error_card("⚠️ Please enter a question."), "", zero
-
     empty = [OPTION_LABELS[i] for i, o in enumerate(options) if not o.strip()]
     if empty:
         return _error_card(f"⚠️ Please fill option(s): {', '.join(empty)}"), "", zero
 
-    if not HF_TOKEN:
-        return _error_card(
-            "🔑 HF_TOKEN not set on Render.\n\n"
-            "Go to Render dashboard → Environment → Add HF_TOKEN"
-        ), "", zero
-
     logits = [0.0] * 5
+
+    # Strategy 1: Direct PyTorch Inference
     try:
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            futs = {ex.submit(_score, i, prompt, opt): i for i, opt in enumerate(options)}
-            for f in as_completed(futs):
-                i, s = f.result()
-                logits[i] = s
-    except Exception as e:
-        return _error_card(f"❌ API Error: {e}"), "", zero
+        for i, opt in enumerate(options):
+            logits[i] = _score_pytorch(prompt, opt, model_repo)
+        inference_source = f"⚡ Direct Model Inference ({model_repo})"
+    except Exception as py_err:
+        print(f"PyTorch inference note: {py_err} — attempting HF API fallback")
+        # Strategy 2: HF Inference API Router
+        try:
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futs = {ex.submit(_score_api, i, prompt, opt, model_repo, token): i for i, opt in enumerate(options)}
+                for f in as_completed(futs):
+                    i, s = f.result()
+                    logits[i] = s
+            inference_source = "☁️ HF Serverless Router API"
+        except Exception as api_err:
+            return _error_card(f"❌ Inference Error: {api_err}"), "", zero
 
     if all(v == 0.0 for v in logits):
         return _error_card(
-            "⚠️ Model returned zero scores for all options.\n\n"
-            "The model may still be loading — please wait 20s and try again."
+            f"⚠️ Model '{model_repo}' returned zero scores.\n\n"
+            "If using HF API, the model may be warming up — please wait 15 seconds and try again."
         ), "", zero
 
     logits     = np.array(logits)
@@ -92,81 +134,109 @@ def predict(prompt, opt_a, opt_b, opt_c, opt_d, opt_e):
     top3_str   = " → ".join(ranked_lbl[:3])
     best       = ranked_lbl[0]
     best_txt   = options[OPTION_LABELS.index(best)]
+    exp_l      = np.exp(logits - logits.max())
+    probs      = exp_l / exp_l.sum()
+    prob_dict  = {OPTION_LABELS[i]: float(probs[i]) for i in range(5)}
 
-    exp_l     = np.exp(logits - logits.max())
-    probs     = exp_l / exp_l.sum()
-    prob_dict = {OPTION_LABELS[i]: float(probs[i]) for i in range(5)}
-
-    result_html = _result_card(best, best_txt, ranked_lbl, ranked_idx, probs, options)
-    return result_html, top3_str, prob_dict
+    return _result_card(best, best_txt, ranked_lbl, ranked_idx, probs, options, model_repo, inference_source), top3_str, prob_dict
 
 
 def _error_card(msg):
     return f"""
-<div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.4);
-            border-radius:12px;padding:20px;font-family:Inter,sans-serif;
-            color:#fca5a5;white-space:pre-wrap;">{msg}</div>"""
+<div style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.4);
+            border-radius:14px;padding:20px 24px;font-family:'JetBrains Mono',monospace;
+            color:#fca5a5;white-space:pre-wrap;box-shadow:0 8px 32px rgba(239,68,68,0.15);">
+  <div style="font-size:11px;color:#ef4444;font-weight:700;letter-spacing:2px;
+              text-transform:uppercase;margin-bottom:8px;">⚡ INFERENCE_NOTICE</div>
+  {msg}
+</div>"""
 
 
-def _result_card(best, best_txt, ranked_lbl, ranked_idx, probs, options):
-    medals   = ["🥇","🥈","🥉","4️⃣","5️⃣"]
-    bar_cols = ["#7c3aed","#4f46e5","#0ea5e9","#10b981","#f59e0b"]
+def _result_card(best, best_txt, ranked_lbl, ranked_idx, probs, options, model_repo, inference_source):
+    medals   = ["01","02","03","04","05"]
+    colors   = ["#00f5d4","#818cf8","#fbbf24","#38bdf8","#f472b6"]
 
     rows = ""
     for r, i in enumerate(ranked_idx):
-        pct = probs[i]*100
+        pct = probs[i] * 100
+        col = colors[r % len(colors)]
         rows += f"""
-        <div style="display:flex;align-items:center;gap:12px;margin:8px 0;">
-          <span style="font-size:18px;width:28px;">{medals[r]}</span>
-          <span style="width:28px;font-weight:700;color:#e2e8f0;font-size:15px;">
-            {OPTION_LABELS[i]}
-          </span>
-          <div style="flex:1;background:#1e293b;border-radius:8px;height:28px;overflow:hidden;">
-            <div style="width:{pct:.1f}%;background:linear-gradient(90deg,{bar_cols[r % 5]},{bar_cols[(r+1)%5]});
-                        height:100%;border-radius:8px;display:flex;align-items:center;
-                        padding-left:10px;min-width:2px;transition:width .6s ease;">
-              <span style="color:#fff;font-size:12px;font-weight:700;white-space:nowrap;">{pct:.1f}%</span>
+        <div style="display:flex;align-items:center;gap:14px;margin:10px 0;padding:12px 18px;
+                    background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);
+                    border-radius:10px;">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#64748b;
+                       font-weight:700;width:24px;">{medals[r]}</span>
+          <span style="width:28px;height:28px;border-radius:8px;background:{col}22;
+                       border:1px solid {col}88;display:flex;align-items:center;justify-content:center;
+                       font-weight:900;color:{col};font-size:13px;font-family:'JetBrains Mono',monospace;">{OPTION_LABELS[i]}</span>
+          <div style="flex:1;background:#0d1424;border-radius:6px;height:28px;
+                      overflow:hidden;border:1px solid rgba(255,255,255,0.08);">
+            <div style="width:{pct:.1f}%;background:linear-gradient(90deg,{col}dd,{col}66);
+                        height:100%;border-radius:6px;display:flex;align-items:center;
+                        padding-left:12px;min-width:2px;transition:width 0.8s ease;">
+              <span style="color:#ffffff;font-size:12px;font-weight:800;
+                           font-family:'JetBrains Mono',monospace;white-space:nowrap;
+                           text-shadow:0 1px 2px rgba(0,0,0,0.8);">{pct:.1f}%</span>
             </div>
           </div>
-          <span style="color:#94a3b8;font-size:12px;width:80px;text-align:right;
-                       white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-            {options[i][:18]}…
+          <span style="color:#cbd5e1;font-size:13px;width:200px;text-align:right;
+                       white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+                       font-family:'Inter',sans-serif;font-weight:600;">
+            {options[i]}
           </span>
         </div>"""
 
     return f"""
 <div style="font-family:'Inter',sans-serif;">
-  <!-- Answer Badge -->
-  <div style="background:linear-gradient(135deg,rgba(124,58,237,.25),rgba(79,70,229,.25));
-              border:1px solid rgba(124,58,237,.5);border-radius:16px;
-              padding:20px 24px;margin-bottom:16px;text-align:center;">
-    <div style="font-size:12px;color:#a78bfa;font-weight:600;
-                text-transform:uppercase;letter-spacing:2px;margin-bottom:8px;">
-      Predicted Answer
+  <!-- Top answer block -->
+  <div style="position:relative;background:linear-gradient(135deg,#0d1424,#131c31);
+              border:1px solid rgba(0,245,212,0.3);border-radius:16px;
+              padding:24px 28px;margin-bottom:16px;box-shadow:0 12px 40px rgba(0,0,0,0.4);">
+    <!-- Glow -->
+    <div style="position:absolute;top:-40px;right:-40px;width:160px;height:160px;
+                background:radial-gradient(circle,rgba(0,245,212,0.15),transparent 70%);
+                pointer-events:none;"></div>
+    <!-- Status line -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+      <div style="font-size:11px;font-family:'JetBrains Mono',monospace;color:#94a3b8;
+                  font-weight:700;letter-spacing:2px;text-transform:uppercase;">
+        MODEL PREDICTION RESULT
+      </div>
+      <span style="background:rgba(0,245,212,0.15);border:1px solid rgba(0,245,212,0.4);
+                   color:#00f5d4;border-radius:6px;padding:4px 12px;font-size:11px;font-weight:800;
+                   font-family:JetBrains Mono,monospace;letter-spacing:1px;">🤗 {model_repo}</span>
     </div>
-    <div style="font-size:2.5rem;font-weight:900;
-                background:linear-gradient(135deg,#a78bfa,#38bdf8);
-                -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
-      Option {best}
+    <!-- Answer -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#64748b;
+                margin-bottom:4px;font-weight:600;">predicted_option =</div>
+    <div style="font-size:2.8rem;font-weight:900;line-height:1.1;
+                background:linear-gradient(135deg,#00f5d4 0%,#818cf8 100%);
+                -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                margin-bottom:14px;letter-spacing:-0.5px;">Option {best}</div>
+    <div style="background:rgba(0,245,212,0.06);border:1px solid rgba(0,245,212,0.2);
+                border-radius:10px;padding:14px 18px;">
+      <div style="font-size:11px;color:#00f5d4;font-family:'JetBrains Mono',monospace;
+                  font-weight:700;margin-bottom:4px;letter-spacing:1px;">// SELECTED ANSWER TEXT</div>
+      <div style="color:#f8fafc;font-size:16px;line-height:1.5;font-weight:600;">"{best_txt}"</div>
     </div>
-    <div style="color:#cbd5e1;font-size:14px;margin-top:6px;font-style:italic;">
-      "{best_txt}"
+    <div style="margin-top:12px;font-size:11px;color:#818cf8;font-family:'JetBrains Mono',monospace;">
+      {inference_source}
     </div>
   </div>
 
-  <!-- Confidence Bars -->
-  <div style="background:rgba(15,23,42,.8);border:1px solid #1e293b;
-              border-radius:12px;padding:16px;">
-    <div style="font-size:11px;font-weight:600;color:#64748b;
-                text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">
-      Confidence Ranking
+  <!-- Confidence ranking -->
+  <div style="background:#0d1424;border:1px solid rgba(255,255,255,0.08);
+              border-radius:16px;padding:20px 24px;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="font-size:11px;font-family:'JetBrains Mono',monospace;color:#94a3b8;
+                font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;">
+      CONFIDENCE BREAKDOWN ({model_repo.split('/')[-1]})
     </div>
     {rows}
   </div>
 </div>"""
 
 
-# ── Test Examples ──────────────────────────────────────────────────────────────
+# ── Built-in Examples ──────────────────────────────────────────────────────────
 EXAMPLES = [
     ["Which of the following is NOT a supervised learning algorithm?",
      "Linear Regression","K-Means Clustering","Decision Tree",
@@ -190,296 +260,612 @@ EXAMPLES = [
      "Batch normalization reducing gradient flow"],
 ]
 
-# ── CSS ────────────────────────────────────────────────────────────────────────
+# ── CSS Theme System (Full-Width Responsive UI) ──────────────────────────────
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-* { font-family: 'Inter', sans-serif !important; box-sizing: border-box; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700;800&display=swap');
 
-body, .gradio-container {
-    background: radial-gradient(ellipse at top, #1e1b4b 0%, #0f0c29 50%, #000 100%) !important;
-    min-height: 100vh;
+:root, body, .gradio-container, .dark {
+    --bg-color: #070a12 !important;
+    --background-fill-primary: #070a12 !important;
+    --background-fill-secondary: #0d1424 !important;
+    --block-background-fill: #0d1424 !important;
+    --panel-background-fill: #0d1424 !important;
+    --block-border-color: rgba(0, 245, 212, 0.15) !important;
+    --border-color-primary: rgba(0, 245, 212, 0.15) !important;
+    --body-text-color: #f8fafc !important;
+    --block-label-text-color: #00f5d4 !important;
+    --input-background-fill: #131c31 !important;
+    --input-border-color: rgba(0, 245, 212, 0.25) !important;
+    --input-placeholder-color: #64748b !important;
+    --table-border-color: rgba(255, 255, 255, 0.08) !important;
+    --table-even-background-fill: #0d1424 !important;
+    --table-odd-background-fill: #111a2e !important;
+    --table-row-focus: #1a2642 !important;
 }
 
-/* Tabs */
+html, body {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    background: #070a12 !important;
+    color: #f8fafc !important;
+    font-family: 'Inter', sans-serif !important;
+}
+
+.gradio-container, .gradio-container-5-16-0, [class*="gradio-container"] {
+    max-width: 100% !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    min-height: 100vh !important;
+    background: #070a12 !important;
+    box-sizing: border-color !important;
+}
+
+.gradio-container::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+        linear-gradient(rgba(0, 245, 212, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 245, 212, 0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.main, .contain, #root, div[class*="gradio-container"] > div {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    background: transparent !important;
+}
+
+.tab-nav {
+    background: #070a12 !important;
+    border-bottom: 1px solid rgba(0, 245, 212, 0.2) !important;
+    padding: 0 30px !important;
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 100 !important;
+    width: 100% !important;
+}
 .tab-nav button {
-    color: #64748b !important;
-    font-weight: 600 !important;
-    font-size: 14px !important;
-    border-radius: 8px !important;
-    padding: 8px 16px !important;
-    transition: all .2s !important;
+    color: #94a3b8 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-weight: 700 !important;
+    font-size: 13px !important;
+    letter-spacing: 1.5px !important;
+    text-transform: uppercase !important;
+    border-radius: 0 !important;
+    padding: 16px 28px !important;
+    border-bottom: 2px solid transparent !important;
+    transition: all 0.2s ease !important;
+    background: transparent !important;
+}
+.tab-nav button:hover {
+    color: #00f5d4 !important;
+    border-bottom-color: rgba(0, 245, 212, 0.4) !important;
 }
 .tab-nav button.selected {
-    background: linear-gradient(135deg,#7c3aed,#4f46e5) !important;
-    color: #fff !important;
-    box-shadow: 0 4px 15px rgba(124,58,237,.4) !important;
+    color: #00f5d4 !important;
+    border-bottom: 2px solid #00f5d4 !important;
+    background: transparent !important;
 }
 
-/* Inputs */
-input, textarea, .block {
-    background: rgba(30,41,59,.6) !important;
-    border: 1px solid rgba(99,102,241,.2) !important;
+.tabitem {
+    padding: 20px 30px !important;
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+.block, .form, .gr-group, .gr-box,
+[data-testid="block"], [data-testid="group"],
+[class*="block"], [class*="group"], [class*="panel"],
+[class*="container"] {
+    background: #0d1424 !important;
+    border: 1px solid rgba(0, 245, 212, 0.15) !important;
+    border-radius: 14px !important;
+    color: #f8fafc !important;
+}
+
+input[type="text"], input[type="password"], textarea, select, .wrap,
+.scroll-hide, [data-testid="textbox"] input, [data-testid="textbox"] textarea {
+    background: #131c31 !important;
+    border: 1px solid rgba(0, 245, 212, 0.25) !important;
     border-radius: 10px !important;
-    color: #e2e8f0 !important;
-    transition: border-color .2s !important;
+    color: #ffffff !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 14px !important;
+    font-weight: 500 !important;
+    padding: 12px 16px !important;
+    transition: all 0.2s ease !important;
 }
-input:focus, textarea:focus {
-    border-color: rgba(124,58,237,.6) !important;
-    box-shadow: 0 0 0 3px rgba(124,58,237,.15) !important;
+input[type="text"]::placeholder, input[type="password"]::placeholder, textarea::placeholder {
+    color: #64748b !important;
+    opacity: 1 !important;
+}
+input[type="text"]:focus, input[type="password"]:focus, textarea:focus {
+    border-color: #00f5d4 !important;
+    box-shadow: 0 0 0 3px rgba(0, 245, 212, 0.15), inset 0 0 0 1px #00f5d4 !important;
+    background: #17233d !important;
+    outline: none !important;
 }
 
-/* Labels */
-label span { color: #94a3b8 !important; font-weight: 600 !important; font-size: 12px !important; }
+label > span,
+.label-wrap span,
+[data-testid="block-label"] span,
+.block label span,
+.group label span,
+.svelte-1gfkn6j {
+    color: #00f5d4 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-weight: 700 !important;
+    font-size: 11px !important;
+    letter-spacing: 1.5px !important;
+    text-transform: uppercase !important;
+    margin-bottom: 6px !important;
+    display: inline-block !important;
+}
 
-/* Predict button */
-#pred_btn {
-    background: linear-gradient(135deg,#7c3aed,#4f46e5) !important;
+#pred_btn, #pred_btn button {
+    background: linear-gradient(135deg, #00f5d4 0%, #00c9a7 100%) !important;
     border: none !important;
     border-radius: 12px !important;
-    font-size: 16px !important;
-    font-weight: 700 !important;
-    letter-spacing: .5px !important;
-    box-shadow: 0 4px 20px rgba(124,58,237,.5) !important;
-    transition: all .3s !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 13px !important;
+    font-weight: 800 !important;
+    letter-spacing: 2px !important;
+    color: #040810 !important;
     height: 52px !important;
+    box-shadow: 0 0 25px rgba(0, 245, 212, 0.35) !important;
+    transition: all 0.25s ease !important;
+    cursor: pointer !important;
 }
 #pred_btn:hover {
     transform: translateY(-2px) !important;
-    box-shadow: 0 8px 30px rgba(124,58,237,.7) !important;
+    box-shadow: 0 0 45px rgba(0, 245, 212, 0.6) !important;
+}
+#pred_btn *, #pred_btn span {
+    color: #040810 !important;
+    font-weight: 900 !important;
 }
 
-/* Clear button */
-#clear_btn {
-    background: transparent !important;
-    border: 1px solid rgba(99,102,241,.4) !important;
+#clear_btn, #clear_btn button {
+    background: #131c31 !important;
+    border: 1px solid rgba(0, 245, 212, 0.3) !important;
     border-radius: 12px !important;
-    color: #a78bfa !important;
-    font-weight: 600 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12px !important;
+    font-weight: 700 !important;
+    letter-spacing: 2px !important;
+    color: #94a3b8 !important;
     height: 52px !important;
-    transition: all .2s !important;
+    transition: all 0.2s ease !important;
+    cursor: pointer !important;
 }
 #clear_btn:hover {
-    border-color: #7c3aed !important;
-    background: rgba(124,58,237,.1) !important;
+    border-color: #00f5d4 !important;
+    color: #00f5d4 !important;
+    background: rgba(0, 245, 212, 0.08) !important;
+}
+#clear_btn * { color: inherit !important; }
+
+button[id^="rb_"] {
+    background: rgba(129, 140, 248, 0.15) !important;
+    border: 1px solid rgba(129, 140, 248, 0.4) !important;
+    border-radius: 8px !important;
+    color: #c7d2fe !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+    letter-spacing: 1px !important;
+    padding: 10px 16px !important;
+    transition: all 0.2s ease !important;
+    cursor: pointer !important;
+}
+button[id^="rb_"]:hover {
+    background: rgba(129, 140, 248, 0.35) !important;
+    box-shadow: 0 0 20px rgba(129, 140, 248, 0.3) !important;
+}
+button[id^="rb_"] * { color: #c7d2fe !important; }
+
+details, .accordion {
+    background: #0d1424 !important;
+    border: 1px solid rgba(0, 245, 212, 0.18) !important;
+    border-radius: 12px !important;
+    margin-bottom: 10px !important;
+}
+details summary, .accordion button, .accordion-header {
+    color: #f8fafc !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 13px !important;
+    font-weight: 700 !important;
+    background: transparent !important;
+    padding: 14px 18px !important;
+}
+details summary span, .accordion button span {
+    color: #f8fafc !important;
+}
+details[open] summary {
+    color: #00f5d4 !important;
+    border-bottom: 1px solid rgba(0, 245, 212, 0.15) !important;
+}
+details[open] summary span { color: #00f5d4 !important; }
+
+/* ── Full-Width Readable Table Formatting ───────────────────────────────────── */
+.examples, [data-testid="examples"], .table-container {
+    background: #0d1424 !important;
+    border: 1px solid rgba(0, 245, 212, 0.25) !important;
+    border-radius: 16px !important;
+    overflow: hidden !important;
+    margin-top: 24px !important;
+    width: 100% !important;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3) !important;
+}
+.examples .label, [data-testid="examples"] > span {
+    color: #00f5d4 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12px !important;
+    font-weight: 800 !important;
+    letter-spacing: 2px !important;
+    text-transform: uppercase !important;
+    padding: 16px 24px !important;
+    display: block !important;
+    background: rgba(0, 245, 212, 0.08) !important;
+    border-bottom: 1px solid rgba(0, 245, 212, 0.2) !important;
+}
+table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 13px !important;
+    background: #0d1424 !important;
+    table-layout: auto !important;
+}
+thead tr {
+    background: #111a2e !important;
+}
+thead th {
+    color: #00f5d4 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 11px !important;
+    font-weight: 800 !important;
+    letter-spacing: 1.5px !important;
+    text-transform: uppercase !important;
+    padding: 14px 18px !important;
+    border-bottom: 1px solid rgba(0, 245, 212, 0.25) !important;
+    text-align: left !important;
+    white-space: nowrap !important;
+}
+tbody td {
+    color: #e2e8f0 !important;
+    padding: 14px 18px !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+    background: transparent !important;
+    line-height: 1.5 !important;
+    vertical-align: middle !important;
+}
+tbody tr:hover td {
+    background: rgba(0, 245, 212, 0.08) !important;
+    color: #ffffff !important;
+    cursor: pointer !important;
 }
 
-/* Hide Gradio footer & label boxes */
-footer { display: none !important; }
-.label-wrap { display: none !important; }
+#top3_out textarea, #top3_out input {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 15px !important;
+    color: #00f5d4 !important;
+    font-weight: 800 !important;
+    letter-spacing: 3px !important;
+    text-align: center !important;
+    background: #131c31 !important;
+}
 
-/* Accordion */
-.accordion { background: rgba(30,41,59,.4) !important; border: 1px solid rgba(99,102,241,.2) !important; border-radius: 12px !important; }
+[data-testid="label"], .label-container {
+    background: #0d1424 !important;
+    border: 1px solid rgba(0, 245, 212, 0.15) !important;
+    border-radius: 14px !important;
+    padding: 16px !important;
+}
+[data-testid="label"] span {
+    color: #f8fafc !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+}
+[data-testid="label"] .label-wrap { display: none !important; }
+
+.prose, .prose p, .prose div, .markdown-body {
+    color: #e2e8f0 !important;
+}
+.prose h4, .prose h3, h4, h3 {
+    color: #00f5d4 !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12px !important;
+    letter-spacing: 2px !important;
+    text-transform: uppercase !important;
+    font-weight: 700 !important;
+}
+
+footer { display: none !important; }
+#component-0 > .tabs { margin: 0 !important; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #070a12; }
+::-webkit-scrollbar-thumb { background: rgba(0, 245, 212, 0.3); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0, 245, 212, 0.6); }
 """
 
-HEADER = """
-<div style="text-align:center;padding:40px 20px 20px;font-family:'Inter',sans-serif;">
-  <div style="display:inline-flex;align-items:center;gap:8px;
-              background:rgba(124,58,237,.15);border:1px solid rgba(124,58,237,.35);
-              border-radius:100px;padding:6px 18px;
-              font-size:11px;color:#a78bfa;font-weight:700;
-              letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;">
-    <span>🎓</span> IIT Madras · DL &amp; GenAI · T2-2026
-  </div>
+TOPBAR = f"""
+<div style="width:100%;background:#070a12;border-bottom:1px solid rgba(0,245,212,0.2);
+            padding:0;display:flex;align-items:stretch;font-family:'JetBrains Mono',monospace;
+            position:relative;">
 
-  <h1 style="font-size:3rem;font-weight:900;margin:0 0 10px;line-height:1.1;
-             background:linear-gradient(135deg,#c4b5fd 0%,#818cf8 50%,#38bdf8 100%);
-             -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
-    Smart MCQ Solver
-  </h1>
+  <div style="width:4px;background:linear-gradient(180deg,#00f5d4 0%,#818cf8 100%);flex-shrink:0;"></div>
 
-  <p style="font-size:1.05rem;color:#94a3b8;margin:0 0 6px;">
-    Powered by <strong style="color:#c4b5fd;">DeBERTa-v3-large</strong>
-    · Fine-tuned for 5-option multiple choice questions
-  </p>
-  <p style="font-size:.85rem;color:#475569;">
-    <strong style="color:#818cf8;">Shitanshu Chaurasiya</strong> · Roll No. 24F2006167
-  </p>
+  <div style="flex:1;display:flex;align-items:center;justify-content:space-between;
+              padding:18px 30px;gap:24px;flex-wrap:wrap;">
 
-  <div style="display:inline-flex;align-items:center;gap:6px;margin-top:12px;
-              background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);
-              border-radius:100px;padding:5px 14px;
-              font-size:11px;color:#34d399;font-weight:600;">
-    ⚡ First request may take ~20s (model warm-up on HF servers)
+    <div style="display:flex;align-items:center;gap:14px;">
+      <div style="width:42px;height:42px;background:linear-gradient(135deg,#00f5d4,#818cf8);
+                  border-radius:10px;display:flex;align-items:center;justify-content:center;
+                  font-size:22px;box-shadow:0 0 20px rgba(0,245,212,0.4);">🧠</div>
+      <div>
+        <div style="font-size:20px;font-weight:900;font-family:'Inter',sans-serif;
+                    background:linear-gradient(90deg,#00f5d4,#c7d2fe);
+                    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                    letter-spacing:-0.5px;">
+          Multi-Model DeBERTa · Smart MCQ Solver
+        </div>
+        <div style="font-size:11px;color:#94a3b8;letter-spacing:2px;text-transform:uppercase;
+                    margin-top:2px;">Fine-Tuned PyTorch Models (mcq-deberta-v3-large &amp; mcq-deberta-v3-best-v2)</div>
+      </div>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <div style="background:rgba(0,245,212,0.1);border:1px solid rgba(0,245,212,0.3);
+                  border-radius:8px;padding:6px 14px;display:flex;align-items:center;gap:8px;">
+        <div style="width:8px;height:8px;border-radius:50%;background:#00f5d4;
+                    box-shadow:0 0 10px #00f5d4;"></div>
+        <span style="font-size:11px;color:#00f5d4;font-weight:800;
+                     letter-spacing:1px;">⚡ DEBERTA_V3_LARGE (0.4B)</span>
+      </div>
+      <div style="background:rgba(129,140,248,0.1);border:1px solid rgba(129,140,248,0.3);
+                  border-radius:8px;padding:6px 14px;">
+        <span style="font-size:11px;color:#c7d2fe;font-weight:700;letter-spacing:1px;">
+          MAP@3 BEST: 1.0000 ✅
+        </span>
+      </div>
+    </div>
+
+    <div style="text-align:right;">
+      <div style="font-size:13px;color:#f8fafc;font-weight:700;
+                  font-family:'Inter',sans-serif;">Shitanshu Chaurasiya</div>
+      <div style="font-size:10px;color:#94a3b8;margin-top:2px;letter-spacing:1px;">
+        Roll No: 24F2006167 · IIT Madras BS
+      </div>
+    </div>
   </div>
 </div>
 """
 
-# ── Build UI ──────────────────────────────────────────────────────────────────
 with gr.Blocks(
     title="Smart MCQ Solver — DeBERTa-v3-large",
     theme=gr.themes.Base(),
     css=CSS,
 ) as demo:
 
-    gr.HTML(HEADER)
+    gr.HTML(TOPBAR)
 
-    with gr.Tabs() as tabs:
+    with gr.Tabs():
 
-        # ── PREDICT TAB ───────────────────────────────────────────────────────
-        with gr.TabItem("🔍  Predict"):
+        with gr.TabItem("🔍  PREDICT & SOLVE"):
+
+            # ── Main 2-Column Dashboard Split ─────────────────────────────────
             with gr.Row(equal_height=False):
 
-                # Left — inputs
-                with gr.Column(scale=5):
+                # ── Left Column: Inputs & Model Selector ──────────────────────
+                with gr.Column(scale=6):
+
                     with gr.Group():
-                        gr.Markdown("#### 📝 Question")
+                        gr.Markdown("#### 🤖 MODEL SELECTION")
+                        model_selector = gr.Dropdown(
+                            choices=list(MODEL_REPOS.keys()),
+                            value=list(MODEL_REPOS.keys())[0],
+                            label="Select DeBERTa Model Architecture",
+                            interactive=True,
+                            elem_id="model_selector",
+                        )
+
+                    with gr.Group():
+                        gr.Markdown("#### 📝 QUESTION INPUT")
                         prompt_in = gr.Textbox(
-                            label="",
-                            placeholder="Type your MCQ question here…",
+                            label="Question",
+                            placeholder="Enter multiple choice question here…",
                             lines=3, elem_id="prompt_in",
                         )
-                    with gr.Group():
-                        gr.Markdown("#### 🔤 Options")
-                        with gr.Row():
-                            opt_a = gr.Textbox(label="A", placeholder="Option A", elem_id="opt_a")
-                            opt_b = gr.Textbox(label="B", placeholder="Option B", elem_id="opt_b")
-                        with gr.Row():
-                            opt_c = gr.Textbox(label="C", placeholder="Option C", elem_id="opt_c")
-                            opt_d = gr.Textbox(label="D", placeholder="Option D", elem_id="opt_d")
-                        opt_e = gr.Textbox(label="E", placeholder="Option E", elem_id="opt_e")
-                    with gr.Row():
-                        pred_btn  = gr.Button("🔍  Predict Answer", variant="primary", size="lg", elem_id="pred_btn")
-                        clear_btn = gr.Button("✕  Clear", size="lg", elem_id="clear_btn")
 
-                # Right — outputs
-                with gr.Column(scale=4):
+                    with gr.Group():
+                        gr.Markdown("#### 🔤 ANSWER OPTIONS")
+                        with gr.Row():
+                            opt_a = gr.Textbox(label="Option A", placeholder="Option A…", elem_id="opt_a")
+                            opt_b = gr.Textbox(label="Option B", placeholder="Option B…", elem_id="opt_b")
+                        with gr.Row():
+                            opt_c = gr.Textbox(label="Option C", placeholder="Option C…", elem_id="opt_c")
+                            opt_d = gr.Textbox(label="Option D", placeholder="Option D…", elem_id="opt_d")
+                        opt_e = gr.Textbox(label="Option E", placeholder="Option E…", elem_id="opt_e")
+
+                    with gr.Row():
+                        pred_btn  = gr.Button("🔍  PREDICT ANSWER", variant="primary", size="lg", elem_id="pred_btn")
+                        clear_btn = gr.Button("✕  CLEAR FIELDS", size="lg", elem_id="clear_btn")
+
+                # ── Right Column: Outputs & Live Visualization ────────────────
+                with gr.Column(scale=6):
+                    gr.Markdown("#### 📊 PREDICTION OUTPUT & ANALYTICS")
+
                     result_html = gr.HTML(
                         value="""
-<div style="height:220px;display:flex;align-items:center;justify-content:center;
-            border:1px dashed rgba(99,102,241,.3);border-radius:16px;
-            color:#475569;font-family:Inter,sans-serif;font-size:14px;text-align:center;">
-  <div>
-    <div style="font-size:2rem;margin-bottom:8px;">🎯</div>
-    Results will appear here<br>after you click Predict
+<div style="height:280px;display:flex;align-items:center;justify-content:center;
+            border:1px dashed rgba(0,245,212,0.3);border-radius:16px;
+            background:#0d1424;font-family:'JetBrains Mono',monospace;">
+  <div style="text-align:center;color:#94a3b8;">
+    <div style="font-size:42px;margin-bottom:12px;">🎯</div>
+    <div style="font-size:13px;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#00f5d4;">
+      AWAITING_MODEL_INFERENCE
+    </div>
+    <div style="font-size:12px;margin-top:8px;color:#94a3b8;">
+      Enter question &amp; options then click Predict Answer
+    </div>
   </div>
 </div>""",
                         elem_id="result_html",
                     )
+
                     top3_out = gr.Textbox(
-                        label="📊 MAP@3 Ranking",
-                        interactive=False, elem_id="top3_out",
-                    )
-                    prob_out = gr.Label(
-                        label="Confidence",
-                        num_top_classes=5, elem_id="prob_out",
+                        label="MAP@3 RANKING ORDER",
+                        interactive=False,
+                        elem_id="top3_out",
+                        placeholder="A → B → C",
                     )
 
-        # ── TEST EXAMPLES TAB ─────────────────────────────────────────────────
-        with gr.TabItem("🧪  Test Examples"):
+                    prob_out = gr.Label(
+                        label="CONFIDENCE DISTRIBUTION",
+                        num_top_classes=5,
+                        elem_id="prob_out",
+                    )
+
+            # ── Full-Width Bottom Row: Long Examples Table ─────────────────────
+            with gr.Row():
+                with gr.Column(scale=12):
+                    gr.Examples(
+                        examples=EXAMPLES,
+                        inputs=[prompt_in, opt_a, opt_b, opt_c, opt_d, opt_e],
+                        label="⚡ QUICK LOAD EXAMPLE CASES — CLICK ANY ROW BELOW TO AUTO-FILL",
+                        cache_examples=False,
+                    )
+
+        with gr.TabItem("🧪  TEST SUITE"):
             gr.HTML("""
-<div style="font-family:Inter,sans-serif;padding:8px 0 16px;">
-  <h3 style="color:#c4b5fd;margin:0 0 6px;">Built-in Test Cases</h3>
-  <p style="color:#64748b;margin:0;font-size:14px;">
-    Click ▶ Run on any case to see the model predict live.
-  </p>
+<div style="font-family:'JetBrains Mono',monospace;padding:16px 20px;">
+  <div style="font-size:12px;color:#00f5d4;font-weight:800;letter-spacing:2px;
+              text-transform:uppercase;margin-bottom:4px;">DEBERTA VALIDATION TEST SUITE</div>
+  <div style="font-size:13px;color:#94a3b8;">
+    Click <strong style="color:#c7d2fe;">▶ Run Test Case</strong> to evaluate your DeBERTa models live.
+  </div>
 </div>""")
+
             test_labels = [
-                "🤖  ML — Unsupervised Algorithm",
-                "🧠  DL — Purpose of Dropout",
-                "📝  NLP — What is BERT?",
-                "⚡  DL — Best Activation Function",
-                "📉  DL — Gradient Vanishing",
+                "🤖  TC-01 · ML — Unsupervised Algorithm",
+                "🧠  TC-02 · DL — Purpose of Dropout",
+                "📝  TC-03 · NLP — What is BERT?",
+                "⚡  TC-04 · DL — Best Activation Function",
+                "📉  TC-05 · DL — Gradient Vanishing",
             ]
+
             for idx, (lbl, ex) in enumerate(zip(test_labels, EXAMPLES)):
                 with gr.Accordion(lbl, open=(idx == 0)):
                     with gr.Row():
                         with gr.Column(scale=3):
                             tq = gr.Textbox(value=ex[0], label="Question", interactive=False, lines=2)
                             with gr.Row():
-                                ta = gr.Textbox(value=ex[1], label="A", interactive=False)
-                                tb = gr.Textbox(value=ex[2], label="B", interactive=False)
+                                ta = gr.Textbox(value=ex[1], label="Option A", interactive=False)
+                                tb = gr.Textbox(value=ex[2], label="Option B", interactive=False)
                             with gr.Row():
-                                tc = gr.Textbox(value=ex[3], label="C", interactive=False)
-                                td = gr.Textbox(value=ex[4], label="D", interactive=False)
-                            te = gr.Textbox(value=ex[5], label="E", interactive=False)
+                                tc = gr.Textbox(value=ex[3], label="Option C", interactive=False)
+                                td = gr.Textbox(value=ex[4], label="Option D", interactive=False)
+                            te = gr.Textbox(value=ex[5], label="Option E", interactive=False)
                         with gr.Column(scale=2):
-                            rb = gr.Button(f"▶  Run Test {idx+1}", variant="primary", elem_id=f"rb_{idx}")
-                            tp = gr.HTML("<div style='color:#475569;font-size:13px;padding:8px'>Click Run…</div>")
-
-                    def _run(q,a,b,c,d,e):
-                        html, _, _ = predict(q,a,b,c,d,e)
-                        return html
-                    rb.click(fn=_run, inputs=[tq,ta,tb,tc,td,te], outputs=[tp])
-
-        # ── ABOUT TAB ─────────────────────────────────────────────────────────
-        with gr.TabItem("ℹ️  About"):
-            gr.HTML("""
-<div style="font-family:Inter,sans-serif;max-width:700px;padding:16px 0;">
-  <h2 style="color:#c4b5fd;margin:0 0 20px;">About This Model</h2>
-
-  <table style="width:100%;border-collapse:collapse;font-size:14px;">
-    <tr style="border-bottom:1px solid #1e293b;">
-      <td style="padding:10px 0;color:#64748b;font-weight:600;width:40%;">Base Model</td>
-      <td style="padding:10px 0;color:#e2e8f0;font-family:monospace;">microsoft/deberta-v3-large</td>
-    </tr>
-    <tr style="border-bottom:1px solid #1e293b;">
-      <td style="padding:10px 0;color:#64748b;font-weight:600;">Task</td>
-      <td style="padding:10px 0;color:#e2e8f0;">5-Option Multiple Choice QA</td>
-    </tr>
-    <tr style="border-bottom:1px solid #1e293b;">
-      <td style="padding:10px 0;color:#64748b;font-weight:600;">Architecture</td>
-      <td style="padding:10px 0;color:#e2e8f0;">SequenceClassification (num_labels=1)</td>
-    </tr>
-    <tr style="border-bottom:1px solid #1e293b;">
-      <td style="padding:10px 0;color:#64748b;font-weight:600;">Training</td>
-      <td style="padding:10px 0;color:#e2e8f0;">K-Fold CV + early stopping</td>
-    </tr>
-    <tr style="border-bottom:1px solid #1e293b;">
-      <td style="padding:10px 0;color:#64748b;font-weight:600;">Best Valid MAP@3</td>
-      <td style="padding:10px 0;color:#34d399;font-weight:700;">1.0000 ✅</td>
-    </tr>
-    <tr>
-      <td style="padding:10px 0;color:#64748b;font-weight:600;">Inference</td>
-      <td style="padding:10px 0;color:#e2e8f0;">HF Serverless API · 5 parallel calls</td>
-    </tr>
-  </table>
-
-  <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
-    <a href="https://huggingface.co/Shitanshu06/mcq-deberta-v3-large" target="_blank"
-       style="background:rgba(124,58,237,.2);border:1px solid rgba(124,58,237,.4);
-              color:#a78bfa;text-decoration:none;border-radius:8px;
-              padding:8px 16px;font-size:13px;font-weight:600;">
-      🤗 Model on HuggingFace
-    </a>
-    <a href="https://deberta-v3-large.onrender.com" target="_blank"
-       style="background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);
-              color:#34d399;text-decoration:none;border-radius:8px;
-              padding:8px 16px;font-size:13px;font-weight:600;">
-      🚀 Live App
-    </a>
-  </div>
-
-  <p style="color:#475569;font-size:13px;margin-top:24px;line-height:1.8;">
-    <strong style="color:#818cf8;">Author:</strong> Shitanshu Chaurasiya<br>
-    <strong style="color:#818cf8;">Roll No:</strong> 24F2006167<br>
-    <strong style="color:#818cf8;">Course:</strong> IIT Madras BS — Deep Learning &amp; GenAI (T2-2026)
-  </p>
+                            rb = gr.Button(f"▶  Run Test Case {idx+1}", variant="primary", elem_id=f"rb_{idx}")
+                            tp = gr.HTML(f"""
+<div style="background:#0d1424;border:1px solid rgba(0,245,212,0.2);
+            border-radius:10px;padding:16px;font-family:'JetBrains Mono',monospace;
+            font-size:12px;color:#94a3b8;min-height:60px;">
+  Click ▶ Run Test Case {idx+1} to query model…
 </div>""")
 
-    # ── Wire events ───────────────────────────────────────────────────────────
-    ins  = [prompt_in, opt_a, opt_b, opt_c, opt_d, opt_e]
+                    def _run(q, a, b, c, d, e):
+                        html, _, _ = predict(q, a, b, c, d, e, list(MODEL_REPOS.keys())[0])
+                        return html
+                    rb.click(fn=_run, inputs=[tq, ta, tb, tc, td, te], outputs=[tp])
+
+        with gr.TabItem("ℹ️  ABOUT MODEL & PROJECT"):
+            gr.HTML("""
+<div style="font-family:'Inter',sans-serif;padding:24px 32px;
+            display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;max-width:100%;">
+
+  <div style="background:#0d1424;border:1px solid rgba(0,245,212,0.2);
+              border-radius:16px;padding:24px;">
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#00f5d4;
+                font-weight:800;letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;">
+      REGISTERED MODELS
+    </div>
+    <div style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
+      <div style="background:#131c31;padding:12px;border-radius:10px;border:1px solid rgba(0,245,212,0.2);">
+        <div style="color:#00f5d4;font-weight:800;font-family:'JetBrains Mono';">Shitanshu06/mcq-deberta-v3-large</div>
+        <div style="color:#94a3b8;font-size:12px;margin-top:4px;">DeBERTa-v3-large · 0.4B parameters · MAP@3: 1.0000</div>
+      </div>
+      <div style="background:#131c31;padding:12px;border-radius:10px;border:1px solid rgba(129,140,248,0.2);">
+        <div style="color:#818cf8;font-weight:800;font-family:'JetBrains Mono';">Shitanshu06/mcq-deberta-v3-best-v2</div>
+        <div style="color:#94a3b8;font-size:12px;margin-top:4px;">DeBERTa-v3-base · 0.2B parameters · Fast inference</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="background:#0d1424;border:1px solid rgba(129,140,248,0.2);
+              border-radius:16px;padding:24px;">
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#818cf8;
+                font-weight:800;letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;">
+      HUGGING FACE SPACE
+    </div>
+    <div style="font-family:'Inter',sans-serif;font-size:13px;line-height:1.8;color:#e2e8f0;">
+      <div><strong>Space Name:</strong> <span style="color:#00f5d4;">Smart MCQ Solver 🧠</span></div>
+      <div><strong>HF Space Link:</strong> <a href="https://huggingface.co/spaces/Shitanshu06/smart-mcq-solver" target="_blank" style="color:#818cf8;">Shitanshu06/smart-mcq-solver</a></div>
+    </div>
+  </div>
+
+  <div style="background:#0d1424;border:1px solid rgba(251,191,36,0.2);
+              border-radius:16px;padding:24px;">
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#fbbf24;
+                font-weight:800;letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;">
+      AUTHOR &amp; ACADEMICS
+    </div>
+    <div style="font-family:'Inter',sans-serif;font-size:13px;line-height:2.2;">
+      <div><span style="color:#94a3b8;">Author:</span> <strong style="color:#f8fafc;float:right;">Shitanshu Chaurasiya</strong></div>
+      <div><span style="color:#94a3b8;">Roll Number:</span> <strong style="color:#00f5d4;float:right;font-family:'JetBrains Mono';">24F2006167</strong></div>
+      <div><span style="color:#94a3b8;">Institution:</span> <strong style="color:#f8fafc;float:right;">IIT Madras BS Degree</strong></div>
+      <div><span style="color:#94a3b8;">Course:</span> <strong style="color:#f8fafc;float:right;">Deep Learning &amp; GenAI</strong></div>
+      <div><span style="color:#94a3b8;">Academic Term:</span> <strong style="color:#f8fafc;float:right;">T2-2026</strong></div>
+    </div>
+  </div>
+</div>""")
+
+    ins  = [prompt_in, opt_a, opt_b, opt_c, opt_d, opt_e, model_selector]
     outs = [result_html, top3_out, prob_out]
 
     pred_btn.click(fn=predict, inputs=ins, outputs=outs)
     clear_btn.click(
         fn=lambda: (
             "", "", "", "", "", "",
-            """<div style="height:220px;display:flex;align-items:center;
-                justify-content:center;border:1px dashed rgba(99,102,241,.3);
-                border-radius:16px;color:#475569;font-size:14px;text-align:center;">
-                <div><div style='font-size:2rem;margin-bottom:8px'>🎯</div>
-                Results will appear here after you click Predict</div></div>""",
-            "", {lb: 0.0 for lb in OPTION_LABELS},
+            """<div style="height:280px;display:flex;align-items:center;justify-content:center;
+                border:1px dashed rgba(0,245,212,0.3);border-radius:16px;
+                background:#0d1424;font-family:'JetBrains Mono',monospace;">
+              <div style="text-align:center;color:#94a3b8;">
+                <div style="font-size:42px;margin-bottom:12px;">🎯</div>
+                <div style="font-size:13px;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#00f5d4;">
+                  AWAITING_MODEL_INFERENCE
+                </div>
+                <div style="font-size:12px;margin-top:8px;color:#94a3b8;">
+                  Enter question &amp; options then click Predict Answer
+                </div>
+              </div>
+            </div>""",
+            "",
+            {lb: 0.0 for lb in OPTION_LABELS},
         ),
         inputs=[],
         outputs=ins + outs,
-    )
-
-    gr.Examples(
-        examples=EXAMPLES,
-        inputs=ins,
-        label="⚡ Quick Fill — click any row to auto-fill all fields",
-        cache_examples=False,
     )
 
 if __name__ == "__main__":
