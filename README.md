@@ -72,8 +72,8 @@ This repository contains the complete inference pipeline, multi-model Gradio web
 
 ### 1. Clone Repository
 ```bash
-git clone https://github.com/24f2006167/DeBERTa-v3-large.git
-cd DeBERTa-v3-large
+git clone https://github.com/24f2006167/Smart-MCQ-Solver-DeBERTa.git
+cd Smart-MCQ-Solver-DeBERTa
 ```
 
 ### 2. Create Virtual Environment & Install Dependencies

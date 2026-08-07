@@ -743,6 +743,25 @@ with gr.Blocks(
             # ── Full-Width Bottom Row: Long Examples Table ─────────────────────
             with gr.Row():
                 with gr.Column(scale=12):
+                    gr.HTML("""
+<div style="background:linear-gradient(135deg, rgba(0,245,212,0.08), rgba(129,140,248,0.08));
+            border:1px solid rgba(0,245,212,0.25);border-radius:14px;
+            padding:16px 24px;margin-top:20px;margin-bottom:8px;
+            font-family:'Inter',sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.2);">
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+    <span style="font-size:24px;background:rgba(0,245,212,0.15);padding:8px 12px;border-radius:10px;">💡</span>
+    <div style="flex:1;">
+      <div style="font-size:12px;font-weight:800;color:#00f5d4;font-family:'JetBrains Mono',monospace;
+                  letter-spacing:1.5px;text-transform:uppercase;">
+        INSTRUCTIONS &amp; QUICK-LOAD GUIDE
+      </div>
+      <div style="font-size:12px;color:#e2e8f0;margin-top:4px;line-height:1.6;">
+        ⚡ <strong>Auto-Fill Question &amp; Options:</strong> Click or double-click any row in the table below to instantly load the question and options into the form.<br/>
+        ✏️ <strong>Custom Question &amp; Options:</strong> You can also type, edit, or paste your own custom question and 5 options directly into the fields above anytime!
+      </div>
+    </div>
+  </div>
+</div>""")
                     gr.Examples(
                         examples=EXAMPLES,
                         inputs=[prompt_in, opt_a, opt_b, opt_c, opt_d, opt_e],
